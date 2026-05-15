@@ -49,6 +49,9 @@ DATE_RANGE_END = os.environ.get('DATE_RANGE_END') or None
 NEIGHBOR_WINDOW = int(os.environ.get('NEIGHBOR_WINDOW', '20'))
 NEIGHBOR_SIZE_RATIO = float(os.environ.get('NEIGHBOR_SIZE_RATIO', '0.5'))
 
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
+SKIP_DIRS = {'Spotlight-V100', 'fseventsd', '.Trashes', '.fseventsd', '.Spotlight-V100', '$RECYCLE.BIN', 'System Volume Information', '@eaDir'}
+
 SEQ_PATTERN = re.compile(r'^([^\d]*?)(\d+)')
 
 def parse_seq(stem):
@@ -93,6 +96,8 @@ print('Loading reference images...')
 reference_encodings = []
 ref_cameras = set()
 for ref_file in Path(REFERENCE_FOLDER).glob('*'):
+    if ref_file.suffix.lower() not in IMAGE_EXTS:
+        continue
     try:
         make, model, _ = get_exif(ref_file)
         if make or model:
@@ -124,9 +129,6 @@ if DATE_RANGE_START or DATE_RANGE_END:
 # --- SCAN PHOTOS ---
 print('Scanning photos...', flush=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
-SKIP_DIRS = {'Spotlight-V100', 'fseventsd', '.Trashes', '.fseventsd', '.Spotlight-V100', '$RECYCLE.BIN', 'System Volume Information'}
 
 def iter_photos(root):
     for dirpath, dirnames, filenames in os.walk(root):
