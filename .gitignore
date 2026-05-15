@@ -1,0 +1,19 @@
+# Personal photos — not for version control
+reference_photos/*
+photo_folder/*
+similar_photos/*
+!reference_photos/.gitkeep
+!photo_folder/.gitkeep
+!similar_photos/.gitkeep
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Local logs
+*.log
