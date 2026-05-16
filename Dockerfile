@@ -25,6 +25,8 @@ ENV NEIGHBOR_WINDOW=20
 ENV NEIGHBOR_SIZE_RATIO=0.5
 # WORKERS unset → defaults to cpu_count() at runtime. Set explicitly to tune.
 ENV WORKERS=
+# Regex(es) to skip by filename. Default catches 4K Stogram (Instagram archive) files.
+ENV SKIP_FILENAME_PATTERNS=^FILE\\d+\\.JPG$
 
 # Set work directory
 WORKDIR /app

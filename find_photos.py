@@ -18,6 +18,8 @@ easier to set env vars in the UI than edit code:
     NEIGHBOR_WINDOW               (int, default 20)
     NEIGHBOR_SIZE_RATIO           (float, default 0.5)
     WORKERS                       (int, default = cpu count; set 1 to disable parallelism)
+    SKIP_FILENAME_PATTERNS        (comma-separated regexes; default '^FILE\\d+\\.JPG$'
+                                   for 4K Stogram Instagram archives)
 """
 
 
@@ -54,6 +56,12 @@ NEIGHBOR_SIZE_RATIO = float(os.environ.get('NEIGHBOR_SIZE_RATIO', '0.5'))
 
 _workers_env = os.environ.get('WORKERS', '').strip()
 WORKERS = int(_workers_env) if _workers_env else (os.cpu_count() or 2)
+
+# Skip files whose name matches any of these regex patterns (case-sensitive).
+# Comma-separated list. Default matches 4K Stogram captures (FILE12345.JPG)
+# which dominate Instagram-archive dumps and never contain personal photos.
+_skip_fn_env = os.environ.get('SKIP_FILENAME_PATTERNS', r'^FILE\d+\.JPG$')
+SKIP_FILENAME_PATTERNS = [re.compile(p) for p in _skip_fn_env.split(',') if p.strip()]
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
 SKIP_DIRS = {'Spotlight-V100', 'fseventsd', '.Trashes', '.fseventsd', '.Spotlight-V100', '$RECYCLE.BIN', 'System Volume Information', '@eaDir'}
@@ -158,18 +166,27 @@ print(f'Loaded {len(reference_encodings)} face encodings from references.')
 print(f'Reference cameras: {sorted(ref_cameras) if ref_cameras else "(none — EXIF camera filter disabled)"}')
 if DATE_RANGE_START or DATE_RANGE_END:
     print(f'Date filter: {DATE_RANGE_START or "..."} to {DATE_RANGE_END or "..."}')
+if SKIP_FILENAME_PATTERNS:
+    print(f'Filename skip patterns: {[p.pattern for p in SKIP_FILENAME_PATTERNS]}')
 
 
 # --- SCAN PHOTOS ---
 print('Scanning photos...', flush=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+skipped_by_filename = 0
+
 def iter_photos(root):
+    global skipped_by_filename
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fn in filenames:
-            if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
-                yield Path(dirpath) / fn
+            if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
+                continue
+            if any(p.match(fn) for p in SKIP_FILENAME_PATTERNS):
+                skipped_by_filename += 1
+                continue
+            yield Path(dirpath) / fn
 
 skipped_by_camera = 0
 skipped_by_date = 0
@@ -224,7 +241,7 @@ with ProcessPoolExecutor(
                 result = None
             completed += 1
             if completed % 100 == 0:
-                print(f'[progress] processed {completed} files (skipped: {skipped_by_camera} camera, {skipped_by_date} date, in-flight: {len(pending)})...', flush=True)
+                print(f'[progress] processed {completed} files (skipped: {skipped_by_filename} filename, {skipped_by_camera} camera, {skipped_by_date} date, in-flight: {len(pending)})...', flush=True)
             if result is not None:
                 face_matches.append(Path(result))
                 print(f'MATCH (face): {result} -> {OUTPUT_FOLDER}/face_match/{Path(result).name}', flush=True)
