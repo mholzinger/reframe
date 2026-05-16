@@ -31,7 +31,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import multiprocessing as mp
 import numpy as np
 
@@ -191,18 +191,44 @@ def filtered_photo_paths():
 print(f'Using {WORKERS} worker process(es) for face_recognition.', flush=True)
 # Use 'fork' so workers inherit reference_encodings without pickling/re-importing.
 mp_ctx = mp.get_context('fork')
+# Bound the in-flight queue depth so we don't materialize all paths in memory
+# at once. Use as_completed/wait so a slow file doesn't block reporting from
+# faster workers (executor.map preserves submission order and would stall).
+QUEUE_DEPTH = WORKERS * 4
 with ProcessPoolExecutor(
     max_workers=WORKERS,
     mp_context=mp_ctx,
     initializer=_worker_init,
     initargs=(reference_encodings, SIMILARITY_THRESHOLD, OUTPUT_FOLDER),
 ) as executor:
-    for idx, result in enumerate(executor.map(_process_one_photo, filtered_photo_paths(), chunksize=1)):
-        if idx % 100 == 0:
-            print(f'[progress] processed {idx} files (skipped: {skipped_by_camera} camera, {skipped_by_date} date)...', flush=True)
-        if result is not None:
-            face_matches.append(Path(result))
-            print(f'MATCH (face): {result} -> {OUTPUT_FOLDER}/face_match/{Path(result).name}', flush=True)
+    paths_iter = filtered_photo_paths()
+    pending = set()
+
+    def submit_more(n):
+        for _ in range(n):
+            try:
+                p = next(paths_iter)
+            except StopIteration:
+                return
+            pending.add(executor.submit(_process_one_photo, p))
+
+    submit_more(QUEUE_DEPTH)
+    completed = 0
+    while pending:
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for fut in done:
+            try:
+                result = fut.result()
+            except Exception as e:
+                print(f'Worker exception: {e}', flush=True)
+                result = None
+            completed += 1
+            if completed % 100 == 0:
+                print(f'[progress] processed {completed} files (skipped: {skipped_by_camera} camera, {skipped_by_date} date, in-flight: {len(pending)})...', flush=True)
+            if result is not None:
+                face_matches.append(Path(result))
+                print(f'MATCH (face): {result} -> {OUTPUT_FOLDER}/face_match/{Path(result).name}', flush=True)
+        submit_more(len(done))
 
 
 # --- NEIGHBOR EXPANSION ---
