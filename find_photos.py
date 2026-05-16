@@ -17,6 +17,7 @@ easier to set env vars in the UI than edit code:
     DATE_RANGE_END                ('YYYY-MM-DD' or empty)
     NEIGHBOR_WINDOW               (int, default 20)
     NEIGHBOR_SIZE_RATIO           (float, default 0.5)
+    WORKERS                       (int, default = cpu count; set 1 to disable parallelism)
 """
 
 
@@ -30,6 +31,8 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 import numpy as np
 
 
@@ -48,6 +51,9 @@ DATE_RANGE_END = os.environ.get('DATE_RANGE_END') or None
 # adjacent sequence numbers (DSC01244, DSC01245, ...) as possible_matches.
 NEIGHBOR_WINDOW = int(os.environ.get('NEIGHBOR_WINDOW', '20'))
 NEIGHBOR_SIZE_RATIO = float(os.environ.get('NEIGHBOR_SIZE_RATIO', '0.5'))
+
+_workers_env = os.environ.get('WORKERS', '').strip()
+WORKERS = int(_workers_env) if _workers_env else (os.cpu_count() or 2)
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
 SKIP_DIRS = {'Spotlight-V100', 'fseventsd', '.Trashes', '.fseventsd', '.Spotlight-V100', '$RECYCLE.BIN', 'System Volume Information', '@eaDir'}
@@ -89,6 +95,34 @@ def in_date_range(dt):
     if DATE_RANGE_END and dt > datetime.strptime(DATE_RANGE_END + ' 23:59:59', '%Y-%m-%d %H:%M:%S'):
         return False
     return True
+
+
+# --- WORKER FUNCTIONS (used by ProcessPoolExecutor) ---
+# Per-worker state, populated by _worker_init then used by _process_one_photo.
+WORKER_REFS = None
+WORKER_THRESHOLD = None
+WORKER_OUTPUT = None
+
+def _worker_init(refs, threshold, output_folder):
+    global WORKER_REFS, WORKER_THRESHOLD, WORKER_OUTPUT
+    WORKER_REFS = refs
+    WORKER_THRESHOLD = threshold
+    WORKER_OUTPUT = output_folder
+
+def _process_one_photo(photo_path_str):
+    """Worker: face_recognition + copy on match. Returns matched path str or None."""
+    photo_path = Path(photo_path_str)
+    try:
+        img = face_recognition.load_image_file(photo_path)
+        encs = face_recognition.face_encodings(img)
+        if any(any(face_recognition.compare_faces(WORKER_REFS, e, tolerance=WORKER_THRESHOLD)) for e in encs):
+            dest = Path(WORKER_OUTPUT) / 'face_match' / photo_path.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(photo_path, dest)
+            return photo_path_str
+    except Exception as e:
+        print(f'Error processing {photo_path}: {e}', flush=True)
+    return None
 
 
 # --- LOAD REFERENCE ENCODINGS ---
@@ -140,29 +174,35 @@ def iter_photos(root):
 skipped_by_camera = 0
 skipped_by_date = 0
 face_matches = []  # list of Path; used for neighbor expansion below
-for idx, photo_path in enumerate(iter_photos(PHOTO_FOLDER)):
-    if idx % 100 == 0:
-        print(f'[progress] scanned {idx} files (skipped: {skipped_by_camera} camera, {skipped_by_date} date)...', flush=True)
-    # EXIF pre-filters: photos with no/corrupted EXIF pass through both filters.
-    make, model, dt = get_exif(photo_path)
-    if ref_cameras and (make or model) and (make, model) not in ref_cameras:
-        skipped_by_camera += 1
-        continue
-    if not in_date_range(dt):
-        skipped_by_date += 1
-        continue
-    try:
-        img = face_recognition.load_image_file(photo_path)
-        encs = face_recognition.face_encodings(img)
-        found = any(any(face_recognition.compare_faces(reference_encodings, enc, tolerance=SIMILARITY_THRESHOLD)) for enc in encs)
-        if found:
-            dest = Path(OUTPUT_FOLDER) / 'face_match' / photo_path.name
-            os.makedirs(dest.parent, exist_ok=True)
-            shutil.copy2(photo_path, dest)
-            face_matches.append(photo_path)
-            print(f'MATCH (face): {photo_path} -> {dest}')
-    except Exception as e:
-        print(f'Error processing {photo_path}: {e}')
+
+def filtered_photo_paths():
+    """Yield string paths of photos that pass EXIF filters. Updates skip counters."""
+    global skipped_by_camera, skipped_by_date
+    for photo_path in iter_photos(PHOTO_FOLDER):
+        make, model, dt = get_exif(photo_path)
+        if ref_cameras and (make or model) and (make, model) not in ref_cameras:
+            skipped_by_camera += 1
+            continue
+        if not in_date_range(dt):
+            skipped_by_date += 1
+            continue
+        yield str(photo_path)
+
+print(f'Using {WORKERS} worker process(es) for face_recognition.', flush=True)
+# Use 'fork' so workers inherit reference_encodings without pickling/re-importing.
+mp_ctx = mp.get_context('fork')
+with ProcessPoolExecutor(
+    max_workers=WORKERS,
+    mp_context=mp_ctx,
+    initializer=_worker_init,
+    initargs=(reference_encodings, SIMILARITY_THRESHOLD, OUTPUT_FOLDER),
+) as executor:
+    for idx, result in enumerate(executor.map(_process_one_photo, filtered_photo_paths(), chunksize=1)):
+        if idx % 100 == 0:
+            print(f'[progress] processed {idx} files (skipped: {skipped_by_camera} camera, {skipped_by_date} date)...', flush=True)
+        if result is not None:
+            face_matches.append(Path(result))
+            print(f'MATCH (face): {result} -> {OUTPUT_FOLDER}/face_match/{Path(result).name}', flush=True)
 
 
 # --- NEIGHBOR EXPANSION ---
