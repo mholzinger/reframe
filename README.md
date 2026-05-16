@@ -12,7 +12,7 @@ Given a folder of reference photos showing the target person, scans an arbitrary
 ## How it works
 
 1. **Reference loading** — reads reference photos, downscales for performance, runs HOG face detection with upsampling to catch smaller/angled faces.
-2. **Filename pre-filter** (optional) — drops files whose name matches a configurable regex before they ever get opened. Defaults to skipping 4K Stogram / Instagram-archive captures (`FILE12345.JPG`-style) which dominate some recovery dumps and never contain personal photos. Free, runs at directory-walk time.
+2. **Filename + size pre-filter** (optional) — drops files whose name matches a configurable regex *and* whose size is below a configurable threshold (default 500 KB). Defaults catch 4K Stogram / Instagram-archive captures (`FILE12345.JPG`, always small) without touching EaseUS-recovered camera photos that share the same naming pattern but are megabytes in size. Cost is one `os.stat` per filename match — still essentially free.
 3. **EXIF pre-filter** (optional) — if reference photos have EXIF, the scanner skips collection photos whose EXIF says a non-matching camera make/model. Photos with no/corrupted EXIF pass through (so recovered files with stripped metadata aren't lost).
 4. **Date range pre-filter** (optional) — skips photos outside a configured `DateTimeOriginal` window. Same pass-through behavior for missing EXIF.
 5. **Parallel face scan** — surviving photos are dispatched to a pool of worker processes (defaults to `cpu_count`). Each worker runs `face_recognition.face_encodings`, compares against reference encodings, and copies hits to `face_match/`. Uses a `wait(FIRST_COMPLETED)` pattern with a bounded in-flight queue so a slow file never blocks reporting from the others.
@@ -71,7 +71,8 @@ Every config knob is set via environment variable, so the same image works for a
 | `NEIGHBOR_WINDOW` | `20` | Numeric range extends ± this many positions past the matched min/max |
 | `NEIGHBOR_SIZE_RATIO` | `0.5` | Neighbor file size must be within this fraction of avg match size (`0` disables) |
 | `WORKERS` | `cpu_count()` | Number of parallel face-recognition worker processes. Set `1` to disable parallelism, or tune down if dlib's internal threading oversubscribes your CPU |
-| `SKIP_FILENAME_PATTERNS` | `^FILE\d+\.JPG$` | Comma-separated regexes. Filenames matching any pattern are skipped at directory-walk time. Default catches 4K Stogram captures; set empty to disable |
+| `SKIP_FILENAME_PATTERNS` | `^FILE\d+\.JPG$` | Comma-separated regexes. Filenames matching any pattern are candidates for the skip filter. Default catches 4K Stogram captures; set empty to disable |
+| `SKIP_FILENAME_MAX_SIZE` | `500000` | Max file size (bytes) for the skip filter to fire. A file must match the regex *and* be no larger than this to be skipped. Set `0` to skip purely by name (dangerous if your dump contains EaseUS-recovered files with `FILE<num>.JPG` names) |
 
 ### Tuning
 

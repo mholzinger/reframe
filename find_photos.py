@@ -20,6 +20,9 @@ easier to set env vars in the UI than edit code:
     WORKERS                       (int, default = cpu count; set 1 to disable parallelism)
     SKIP_FILENAME_PATTERNS        (comma-separated regexes; default '^FILE\\d+\\.JPG$'
                                    for 4K Stogram Instagram archives)
+    SKIP_FILENAME_MAX_SIZE        (int bytes, default 500000; only skip when filename
+                                   matches AND size <= this — protects EaseUS-recovered
+                                   photos that share the FILE<num>.JPG naming pattern)
 """
 
 
@@ -60,8 +63,17 @@ WORKERS = int(_workers_env) if _workers_env else (os.cpu_count() or 2)
 # Skip files whose name matches any of these regex patterns (case-sensitive).
 # Comma-separated list. Default matches 4K Stogram captures (FILE12345.JPG)
 # which dominate Instagram-archive dumps and never contain personal photos.
+# IMPORTANT: filename match is necessary but not sufficient — the file must
+# also be <= SKIP_FILENAME_MAX_SIZE to be skipped. This protects EaseUS-
+# recovered photos that happen to share the FILE<num>.JPG naming convention.
 _skip_fn_env = os.environ.get('SKIP_FILENAME_PATTERNS', r'^FILE\d+\.JPG$')
 SKIP_FILENAME_PATTERNS = [re.compile(p) for p in _skip_fn_env.split(',') if p.strip()]
+# Max file size (bytes) to consider for skip-by-filename. Larger files are
+# processed regardless of filename — real camera photos are always >500 KB,
+# while Instagram-archive captures are <200 KB in practice. Set 0 to disable
+# the size guard (revert to pure filename-only matching — dangerous on
+# EaseUS dumps that reuse the FILE<num>.JPG naming).
+SKIP_FILENAME_MAX_SIZE = int(os.environ.get('SKIP_FILENAME_MAX_SIZE', '500000'))
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
 SKIP_DIRS = {'Spotlight-V100', 'fseventsd', '.Trashes', '.fseventsd', '.Spotlight-V100', '$RECYCLE.BIN', 'System Volume Information', '@eaDir'}
@@ -167,7 +179,8 @@ print(f'Reference cameras: {sorted(ref_cameras) if ref_cameras else "(none — E
 if DATE_RANGE_START or DATE_RANGE_END:
     print(f'Date filter: {DATE_RANGE_START or "..."} to {DATE_RANGE_END or "..."}')
 if SKIP_FILENAME_PATTERNS:
-    print(f'Filename skip patterns: {[p.pattern for p in SKIP_FILENAME_PATTERNS]}')
+    guard = f'<= {SKIP_FILENAME_MAX_SIZE} bytes' if SKIP_FILENAME_MAX_SIZE > 0 else 'no size guard (dangerous on EaseUS dumps)'
+    print(f'Filename skip patterns: {[p.pattern for p in SKIP_FILENAME_PATTERNS]} (only when {guard})')
 
 
 # --- SCAN PHOTOS ---
@@ -183,10 +196,21 @@ def iter_photos(root):
         for fn in filenames:
             if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
                 continue
-            if any(p.match(fn) for p in SKIP_FILENAME_PATTERNS):
-                skipped_by_filename += 1
-                continue
-            yield Path(dirpath) / fn
+            full_path = os.path.join(dirpath, fn)
+            if SKIP_FILENAME_PATTERNS and any(p.match(fn) for p in SKIP_FILENAME_PATTERNS):
+                # Filename matches a junk pattern. Confirm via size guard:
+                # real camera photos are always large, so a small file that
+                # matches the pattern is almost certainly the actual junk.
+                if SKIP_FILENAME_MAX_SIZE <= 0:
+                    skipped_by_filename += 1
+                    continue
+                try:
+                    if os.path.getsize(full_path) <= SKIP_FILENAME_MAX_SIZE:
+                        skipped_by_filename += 1
+                        continue
+                except OSError:
+                    pass  # let the worker try and report a real error
+            yield Path(full_path)
 
 skipped_by_camera = 0
 skipped_by_date = 0

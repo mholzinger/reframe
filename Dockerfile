@@ -27,6 +27,10 @@ ENV NEIGHBOR_SIZE_RATIO=0.5
 ENV WORKERS=
 # Regex(es) to skip by filename. Default catches 4K Stogram (Instagram archive) files.
 ENV SKIP_FILENAME_PATTERNS=^FILE\\d+\\.JPG$
+# Filename skip only triggers if the file is <= this many bytes (real camera
+# photos are always larger). Protects EaseUS-recovered photos sharing the
+# FILE<num>.JPG naming pattern. Set 0 to disable size guard (dangerous).
+ENV SKIP_FILENAME_MAX_SIZE=500000
 
 # Set work directory
 WORKDIR /app
