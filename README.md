@@ -12,10 +12,11 @@ Given a folder of reference photos showing the target person, scans an arbitrary
 ## How it works
 
 1. **Reference loading** — reads reference photos, downscales for performance, runs HOG face detection with upsampling to catch smaller/angled faces.
-2. **EXIF pre-filter** (optional) — if reference photos have EXIF, the scanner skips collection photos whose EXIF says a non-matching camera make/model. Photos with no/corrupted EXIF pass through (so recovered files with stripped metadata aren't lost).
-3. **Date range pre-filter** (optional) — skips photos outside a configured `DateTimeOriginal` window. Same pass-through behavior for missing EXIF.
-4. **Face scan** — for each surviving photo, runs `face_recognition.face_encodings` and compares against reference encodings. Hits get copied to `face_match/`.
-5. **Neighbor expansion** — after the scan, groups face matches by `(directory, filename_prefix)`, computes numeric range, and copies same-prefix siblings in the expanded window (with an optional file-size sanity check) to `possible_matches/`.
+2. **Filename pre-filter** (optional) — drops files whose name matches a configurable regex before they ever get opened. Defaults to skipping 4K Stogram / Instagram-archive captures (`FILE12345.JPG`-style) which dominate some recovery dumps and never contain personal photos. Free, runs at directory-walk time.
+3. **EXIF pre-filter** (optional) — if reference photos have EXIF, the scanner skips collection photos whose EXIF says a non-matching camera make/model. Photos with no/corrupted EXIF pass through (so recovered files with stripped metadata aren't lost).
+4. **Date range pre-filter** (optional) — skips photos outside a configured `DateTimeOriginal` window. Same pass-through behavior for missing EXIF.
+5. **Parallel face scan** — surviving photos are dispatched to a pool of worker processes (defaults to `cpu_count`). Each worker runs `face_recognition.face_encodings`, compares against reference encodings, and copies hits to `face_match/`. Uses a `wait(FIRST_COMPLETED)` pattern with a bounded in-flight queue so a slow file never blocks reporting from the others.
+6. **Neighbor expansion** — after the scan, groups face matches by `(directory, filename_prefix)`, computes numeric range, and copies same-prefix siblings in the expanded window (with an optional file-size sanity check) to `possible_matches/`.
 
 ## Requirements
 
@@ -69,6 +70,8 @@ Every config knob is set via environment variable, so the same image works for a
 | `DATE_RANGE_END` | (unset) | EXIF date filter end, `YYYY-MM-DD` |
 | `NEIGHBOR_WINDOW` | `20` | Numeric range extends ± this many positions past the matched min/max |
 | `NEIGHBOR_SIZE_RATIO` | `0.5` | Neighbor file size must be within this fraction of avg match size (`0` disables) |
+| `WORKERS` | `cpu_count()` | Number of parallel face-recognition worker processes. Set `1` to disable parallelism, or tune down if dlib's internal threading oversubscribes your CPU |
+| `SKIP_FILENAME_PATTERNS` | `^FILE\d+\.JPG$` | Comma-separated regexes. Filenames matching any pattern are skipped at directory-walk time. Default catches 4K Stogram captures; set empty to disable |
 
 ### Tuning
 
@@ -76,13 +79,15 @@ Every config knob is set via environment variable, so the same image works for a
 - **Missing obvious face matches** — raise `SIMILARITY_THRESHOLD` toward `0.6`, or add more/better reference photos.
 - **Too few neighbors picked up** — raise `NEIGHBOR_WINDOW` (try `50`) or disable the size filter (`NEIGHBOR_SIZE_RATIO=0`).
 - **Too much noise in `possible_matches/`** — tighten `NEIGHBOR_WINDOW` (try `5`–`10`) and lower `NEIGHBOR_SIZE_RATIO` to `0.3`.
+- **Scan throughput feels low** — check the `[progress]` line. If `in-flight` is consistently at `WORKERS * 4`, workers are saturated and you're at hardware ceiling. If `in-flight` is small and CPU isn't pinned, EXIF reads in the main process may be the bottleneck on slow disks. On a 4-core NAS, `WORKERS=3` often beats `WORKERS=4` because dlib uses some internal threading and 4 workers can oversubscribe.
+- **Dump dominated by Instagram-archive junk** — confirm `SKIP_FILENAME_PATTERNS` is biting (the progress line shows the `skipped: N filename` count). Add more patterns to skip other recognized-junk filenames, e.g. `SKIP_FILENAME_PATTERNS='^FILE\d+\.JPG$,^thumb_,^icon_'`.
 
 ## Limitations
 
 - **No visible face = no direct match.** Subjects turned away, occluded, or out-of-frame won't be caught by face matching. Neighbor expansion is the partial workaround, but it only helps when sequential filenames are preserved.
 - **Recovery dumps lose metadata.** Most file-recovery tools strip EXIF and assign random filenames. The EXIF filters here pass unmatched-EXIF files through by design (so recovered files aren't lost), but that also means the filters do less work the messier the source.
 - **Identity, not visual similarity.** This is a face-recognition tool, not a person-re-identification tool. It can't reliably tell person A's body from person B's body in a photo with no visible face.
-- **CPU-bound.** No GPU support. Expect roughly 1–2 images/second per CPU core; a 100k-image collection on a typical multi-core CPU is a multi-hour to multi-day job.
+- **CPU-bound.** No GPU support. Expect roughly 1–2 images/second per CPU core; a 100k-image collection on a typical multi-core CPU is a multi-hour to multi-day job. Parallelism scales near-linearly with `WORKERS` until you saturate cores.
 
 ## Tips
 
