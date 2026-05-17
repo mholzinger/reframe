@@ -11,11 +11,11 @@ Given a folder of reference photos showing the target person, scans an arbitrary
 
 ## How it works
 
-1. **Reference loading** — reads reference photos, downscales for performance, runs HOG face detection with upsampling to catch smaller/angled faces.
+1. **Reference loading** — reads reference photos, downscales, and tries face detection with progressively more aggressive strategies (HOG → HOG+upsample → CNN at 800px). For references where automatic detection fails, use `crop_references.py` to manually crop face bounding boxes and save a pickle of encodings (see [Generating better references](#generating-better-references)).
 2. **Filename + size pre-filter** (optional) — drops files whose name matches a configurable regex *and* whose size is below a configurable threshold (default 500 KB). Defaults catch 4K Stogram / Instagram-archive captures (`FILE12345.JPG`, always small) without touching EaseUS-recovered camera photos that share the same naming pattern but are megabytes in size. Cost is one `os.stat` per filename match — still essentially free.
 3. **EXIF pre-filter** (optional) — if reference photos have EXIF, the scanner skips collection photos whose EXIF says a non-matching camera make/model. Photos with no/corrupted EXIF pass through (so recovered files with stripped metadata aren't lost).
 4. **Date range pre-filter** (optional) — skips photos outside a configured `DateTimeOriginal` window. Same pass-through behavior for missing EXIF.
-5. **Parallel face scan** — surviving photos are dispatched to a pool of worker processes (defaults to `cpu_count`). Each worker runs `face_recognition.face_encodings`, compares against reference encodings, and copies hits to `face_match/`. Uses a `wait(FIRST_COMPLETED)` pattern with a bounded in-flight queue so a slow file never blocks reporting from the others.
+5. **Parallel face scan** — surviving photos are dispatched to a pool of worker processes (defaults to `cpu_count`). Each worker runs `face_recognition.face_encodings`, compares against reference encodings, and copies hits to `face_match/`. Uses a `wait(FIRST_COMPLETED)` pattern with a bounded in-flight queue so a slow file never blocks reporting from the others. **All face encodings + EXIF are cached in a SQLite DB** keyed on `(path, size, mtime)`, so re-runs after threshold or reference changes skip the expensive encoding step and finish in minutes instead of hours.
 6. **Neighbor expansion** — after the scan, groups face matches by `(directory, filename_prefix)`, computes numeric range, and copies same-prefix siblings in the expanded window (with an optional file-size sanity check) to `possible_matches/`.
 
 ## Requirements
@@ -73,6 +73,9 @@ Every config knob is set via environment variable, so the same image works for a
 | `WORKERS` | `cpu_count()` | Number of parallel face-recognition worker processes. Set `1` to disable parallelism, or tune down if dlib's internal threading oversubscribes your CPU |
 | `SKIP_FILENAME_PATTERNS` | `^FILE\d+\.JPG$` | Comma-separated regexes. Filenames matching any pattern are candidates for the skip filter. Default catches 4K Stogram captures; set empty to disable |
 | `SKIP_FILENAME_MAX_SIZE` | `500000` | Max file size (bytes) for the skip filter to fire. A file must match the regex *and* be no larger than this to be skipped. Set `0` to skip purely by name (dangerous if your dump contains EaseUS-recovered files with `FILE<num>.JPG` names) |
+| `REFERENCE_PICKLE` | (unset) | Path to a pickle of pre-computed face encodings (produced by `crop_references.py`). If set and the file exists, used instead of re-encoding `REFERENCE_FOLDER` each run. Higher recall when used with manual cropping |
+| `EXIF_SERIAL_FILTER` | (unset) | Comma-separated camera EXIF `SerialNumber`s to allow. Files with EXIF serial *not* in this list are skipped; files with no EXIF serial pass through. Strong "shot by this camera" fingerprint when EXIF survives |
+| `CACHE_PATH` | `$OUTPUT_FOLDER/.cache/encodings.db` | SQLite cache of face encodings + EXIF. Set empty to disable. Survives across runs; re-runs after config tweaks are much faster |
 
 ### Tuning
 
@@ -82,6 +85,34 @@ Every config knob is set via environment variable, so the same image works for a
 - **Too much noise in `possible_matches/`** — tighten `NEIGHBOR_WINDOW` (try `5`–`10`) and lower `NEIGHBOR_SIZE_RATIO` to `0.3`.
 - **Scan throughput feels low** — check the `[progress]` line. If `in-flight` is consistently at `WORKERS * 4`, workers are saturated and you're at hardware ceiling. If `in-flight` is small and CPU isn't pinned, EXIF reads in the main process may be the bottleneck on slow disks. On a 4-core NAS, `WORKERS=3` often beats `WORKERS=4` because dlib uses some internal threading and 4 workers can oversubscribe.
 - **Dump dominated by Instagram-archive junk** — confirm `SKIP_FILENAME_PATTERNS` is biting (the progress line shows the `skipped: N filename` count). Add more patterns to skip other recognized-junk filenames, e.g. `SKIP_FILENAME_PATTERNS='^FILE\d+\.JPG$,^thumb_,^icon_'`.
+- **Iterating on threshold / references** — after the first full scan, the SQLite cache (`CACHE_PATH`) has every file's face encodings. A re-run with a tighter `SIMILARITY_THRESHOLD` or improved `REFERENCE_PICKLE` skips the encoding step entirely and finishes in minutes.
+- **Very few reference encodings (e.g. 3 of 12)** — the original HOG detector misses angled faces. The pipeline now tries HOG → HOG+upsample → CNN at 800px automatically, but for the hardest references run `crop_references.py --manual` to add manually-cropped encodings.
+
+## Helper utilities
+
+### Generating better references
+
+`face_recognition`'s default HOG detector misses references with angled or partial faces. The bundled `crop_references.py` script tries multiple detection strategies and falls back to manual bounding-box entry for the ones that fail:
+
+```bash
+# Inside the container (or with face_recognition installed locally):
+python crop_references.py ./reference_photos --manual --output ./reference_encodings.pkl
+```
+
+For each reference photo that automatic detection misses, you'll get a prompt. Open the file in any image viewer, eyeball the face bounding box, and type `top right bottom left` (pixel coordinates from the full-resolution image). Type `skip` to skip, `open` to print the absolute path, or Ctrl-D to exit.
+
+Then set `REFERENCE_PICKLE=/app/reference_encodings.pkl` in your `docker run` command (or in Synology Container Manager's Environment tab) and the much-richer encoding set will be used for every subsequent scan.
+
+### Verifying the filename skip filter
+
+The default filter (`SKIP_FILENAME_PATTERNS=^FILE\d+\.JPG$` AND size ≤ 500 KB) is designed to nuke 4K Stogram Instagram archives without touching real camera photos. But if your recovery dump has a different naming convention, the filter could be silently throwing away files you care about. Run the bundled verifier before trusting the filter on a new dump:
+
+```bash
+# On the NAS (requires exiftool: opkg install exiftool):
+./scripts/verify_skipped.sh "/volume1/_Backups/4TDrive/your-dump" 50
+```
+
+The script samples 50 files the filter would skip, dumps their EXIF, and prints a verdict: **SAFE**, **CAUTION**, or **STOP**. If any sampled file has a Make/Model/SerialNumber EXIF tag, the filter is wrong for your dump and needs to be tightened before committing to a multi-hour scan.
 
 ## Limitations
 
