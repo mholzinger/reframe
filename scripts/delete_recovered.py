@@ -24,6 +24,7 @@ Typical workflow:
 """
 
 import argparse
+import csv
 import os
 import re
 import sys
@@ -55,6 +56,40 @@ def parse_log_for_sources(log_path, container_source_prefix, host_source_prefix)
     return seen
 
 
+def parse_manifest_for_sources(manifest_path, container_source_prefix, host_source_prefix,
+                                exclude_categories=None):
+    """Parse a cluster_faces.py manifest.csv. Returns dict basename → host_path
+    for source paths starting with container_source_prefix, after filtering out
+    rows in any excluded category.
+
+    A row's category is the set of cluster names in column 3 (e.g. 'cluster_001',
+    or 'noise', or '' which is treated as 'no_face').
+    """
+    exclude = set(exclude_categories or [])
+    seen = {}
+    category_counts = {}
+    with open(manifest_path, encoding='utf-8') as f:
+        reader = csv.reader(f)
+        next(reader, None)  # header
+        for row in reader:
+            if len(row) < 3:
+                continue
+            source_path, _face_count, clusters_col = row[0], row[1], row[2]
+            if not source_path.startswith(container_source_prefix):
+                continue
+            row_cats = set(clusters_col.split(',')) if clusters_col else {'no_face'}
+            for cat in row_cats:
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+            # Skip only if EVERY category the row belongs to is excluded.
+            if exclude and not (row_cats - exclude):
+                continue
+            relative = source_path[len(container_source_prefix):].lstrip('/')
+            host_path = os.path.join(host_source_prefix, relative)
+            basename = os.path.basename(source_path)
+            seen[basename] = host_path
+    return seen, category_counts
+
+
 def walk_face_match(face_match_root, exclude_subdirs):
     """Return dict of basename → relative path under face_match."""
     out = {}
@@ -84,17 +119,20 @@ def send_to_trash(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--log', required=True, help='Path to reframe.log with MATCH lines')
-    ap.add_argument('--face-match', help='face_match/ directory root (kept files). Required unless --log-only.')
+    ap.add_argument('--log', help='Path to reframe.log with MATCH lines (mutually exclusive with --manifest)')
+    ap.add_argument('--manifest', help='Path to cluster_faces.py manifest.csv (mutually exclusive with --log)')
+    ap.add_argument('--face-match', help='face_match/ directory root (kept files). Required for --log unless --log-only.')
     ap.add_argument('--source', required=True, help='Host path to source dump root')
     ap.add_argument('--container-source', default='/app/photo_folder',
-                    help='Container-side prefix in log lines (default: /app/photo_folder)')
+                    help='Container-side prefix in log/manifest paths (default: /app/photo_folder)')
     ap.add_argument('--exclude', action='append', default=[],
-                    help='Subfolder name(s) of face_match to skip (e.g. not_matched). Repeatable.')
+                    help='Subfolder name(s) of face_match to skip (e.g. not_matched). Log mode only. Repeatable.')
     ap.add_argument('--log-only', action='store_true',
-                    help='Trust the log as the sole keepers list. Skips face_match walk. '
-                         'Deletes source for every MATCH line. Use when you have already '
-                         'moved/copied all matches out and just want the source dump cleaned up.')
+                    help='Log mode: trust the log as the sole keepers list. Skips face_match walk. '
+                         'Deletes source for every MATCH line.')
+    ap.add_argument('--exclude-cluster', action='append', default=[],
+                    help='Manifest mode: skip rows in this cluster category (repeatable). '
+                         'Common values: no_face, noise.')
     ap.add_argument('--commit', action='store_true', help='Actually delete (rm). Implies real deletion.')
     ap.add_argument('--trash', action='store_true', help='Move to macOS Trash instead of rm.')
     ap.add_argument('--limit', type=int, default=5000, help='Refuse to act on more than this many files (default 5000).')
@@ -104,48 +142,75 @@ def main():
     if args.commit and args.trash:
         print('Use either --commit (rm) or --trash, not both.', file=sys.stderr)
         sys.exit(2)
-    if not args.log_only and not args.face_match:
-        print('--face-match is required unless --log-only is set.', file=sys.stderr)
+    if bool(args.log) == bool(args.manifest):
+        print('Exactly one of --log or --manifest must be specified.', file=sys.stderr)
+        sys.exit(2)
+    if args.log and not args.log_only and not args.face_match:
+        print('--face-match is required with --log unless --log-only is set.', file=sys.stderr)
         sys.exit(2)
 
     dry_run = not (args.commit or args.trash)
+    use_manifest = bool(args.manifest)
 
-    log_path = Path(args.log).resolve()
     source_root = Path(args.source).resolve()
     face_match = Path(args.face_match).resolve() if args.face_match else None
+    input_path = Path(args.manifest if use_manifest else args.log).resolve()
 
-    if not log_path.is_file():
-        sys.exit(f'Log not found: {log_path}')
+    if not input_path.is_file():
+        sys.exit(f'Input not found: {input_path}')
     if face_match is not None and not face_match.is_dir():
         sys.exit(f'face_match folder not found: {face_match}')
     if not source_root.is_dir():
         sys.exit(f'source root not found: {source_root}')
 
-    print(f'Log:        {log_path}')
-    print(f'face_match: {face_match or "(skipped — --log-only)"}')
+    print(f'Input:      {input_path} ({"manifest" if use_manifest else "log"})')
+    print(f'face_match: {face_match or "(n/a)"}')
     print(f'source:     {source_root}')
-    print(f'Excluding:  {args.exclude or "(none)"}')
+    if use_manifest:
+        print(f'Excluding cluster categories: {args.exclude_cluster or "(none)"}')
+    else:
+        print(f'Excluding face_match subdirs: {args.exclude or "(none)"}')
     print(f'Mode:       {"dry-run" if dry_run else ("trash" if args.trash else "rm -f")}')
     print()
-
-    print('Parsing log for basename → source mapping...')
-    basename_to_source = parse_log_for_sources(log_path, args.container_source, str(source_root))
-    print(f'  found {len(basename_to_source)} unique basenames in MATCH lines')
 
     plan = []
     missing_in_log = []
     missing_source = []
     size_mismatch = []
 
-    if args.log_only:
+    if use_manifest:
+        print('Parsing manifest.csv...')
+        basename_to_source, cat_counts = parse_manifest_for_sources(
+            input_path, args.container_source, str(source_root),
+            exclude_categories=args.exclude_cluster)
+        print(f'  total rows in source: {sum(cat_counts.values())}')
+        for cat in sorted(cat_counts.keys()):
+            marker = ' (excluded)' if cat in (args.exclude_cluster or []) else ''
+            print(f'    {cat}: {cat_counts[cat]}{marker}')
+        print(f'  candidates after filtering: {len(basename_to_source)}')
+        print()
+        for basename, source_path in basename_to_source.items():
+            if not os.path.isfile(source_path):
+                missing_source.append((basename, source_path))
+                continue
+            plan.append((source_path, None))
+
+    elif args.log_only:
+        print('Parsing log for basename → source mapping...')
+        basename_to_source = parse_log_for_sources(input_path, args.container_source, str(source_root))
+        print(f'  found {len(basename_to_source)} unique basenames in MATCH lines')
         print('Mode: --log-only — using log entries as the keepers list.')
         print()
         for basename, source_path in basename_to_source.items():
             if not os.path.isfile(source_path):
                 missing_source.append((basename, source_path))
                 continue
-            plan.append((source_path, None))  # no face_match copy to cross-check against
+            plan.append((source_path, None))
+
     else:
+        print('Parsing log for basename → source mapping...')
+        basename_to_source = parse_log_for_sources(input_path, args.container_source, str(source_root))
+        print(f'  found {len(basename_to_source)} unique basenames in MATCH lines')
         print('Walking face_match for currently-kept files...')
         kept_basenames = walk_face_match(face_match, set(args.exclude))
         print(f'  found {len(kept_basenames)} kept files (after exclude)')
