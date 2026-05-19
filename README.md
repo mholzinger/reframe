@@ -103,6 +103,45 @@ For each reference photo that automatic detection misses, you'll get a prompt. O
 
 Then set `REFERENCE_PICKLE=/app/reference_encodings.pkl` in your `docker run` command (or in Synology Container Manager's Environment tab) and the much-richer encoding set will be used for every subsequent scan.
 
+### Clustering recovered photos by face identity
+
+After `find_photos.py` has scanned a collection, the SQLite cache holds face encodings for every photo it touched. `cluster_faces.py` reuses those encodings to group photos by detected face identity — no labels needed, no model retraining. Useful when you've recovered hundreds of photos containing many different people (other models, friends, photographers) and want them automatically sorted.
+
+Inside the container (or via `docker run reframe python cluster_faces.py ...`):
+
+```bash
+python cluster_faces.py \
+  --input /app/photo_folder \
+  --input /app/similar_photos/face_match \
+  --cache /app/similar_photos/.cache/encodings.db \
+  --output /app/similar_photos/clusters \
+  --eps 0.45 \
+  --min-samples 3 \
+  --workers 3
+```
+
+You can pass `--input` multiple times to combine sources. The script reuses cached encodings (essentially free) and only encodes uncached files in parallel.
+
+Output structure:
+
+```
+similar_photos/clusters/
+├── cluster_001/    # largest group of one identity (copied/linked photos)
+├── cluster_002/
+├── ...
+├── noise/          # singletons or groups below --min-samples
+├── no_face/        # photos where no face was detected
+└── manifest.csv    # per-photo: path, face_count, cluster names
+```
+
+Photos containing multiple faces (e.g., two people in one shot) appear in **every** matching cluster.
+
+Tuning:
+- **Too many clusters / same person split** — raise `--eps` (e.g., `0.50`). Easier to merge identities.
+- **People merged together** — lower `--eps` (e.g., `0.40`). Stricter identity match.
+- **Cluster folders cluttered with one-offs** — raise `--min-samples` to a higher number; rare-faces go to `noise/`.
+- **Save disk space** — add `--link` to use hardlinks instead of copies (requires same filesystem; matters on a NAS).
+
 ### Verifying the filename skip filter
 
 The default filter (`SKIP_FILENAME_PATTERNS=^FILE\d+\.JPG$` AND size ≤ 500 KB) is designed to nuke 4K Stogram Instagram archives without touching real camera photos. But if your recovery dump has a different naming convention, the filter could be silently throwing away files you care about. Run the bundled verifier before trusting the filter on a new dump:
