@@ -28,6 +28,7 @@ Usage:
 import argparse
 import csv
 import os
+import re
 import sys
 import shutil
 from collections import defaultdict
@@ -44,6 +45,12 @@ import cache as cache_mod
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
 SKIP_DIRS = {'Spotlight-V100', 'fseventsd', '.Trashes', '.fseventsd', '.Spotlight-V100',
              '$RECYCLE.BIN', 'System Volume Information', '@eaDir', '.cache'}
+
+# Reuse the same skip filter as find_photos.py so cluster runs over the
+# eligible set, not the IG-archive junk. Defaults match find_photos.py.
+_skip_fn_env = os.environ.get('SKIP_FILENAME_PATTERNS', r'^FILE\d+\.JPG$')
+SKIP_FILENAME_PATTERNS = [re.compile(p) for p in _skip_fn_env.split(',') if p.strip()]
+SKIP_FILENAME_MAX_SIZE = int(os.environ.get('SKIP_FILENAME_MAX_SIZE', '500000'))
 
 
 # ---- Worker for parallel encoding of cache-miss files ----
@@ -139,8 +146,11 @@ def cluster_by_distance(encodings, eps):
 # ---- Walk + collect ----
 
 
-def walk_images(roots, skip_filename_patterns=None):
-    """Yield image paths from one or more input roots."""
+def walk_images(roots, apply_skip_filter=True):
+    """Yield image paths from one or more input roots.
+    Applies the same SKIP_FILENAME_PATTERNS + size guard as find_photos.py
+    by default. Set apply_skip_filter=False to walk everything.
+    """
     for root in roots:
         root = Path(root)
         if not root.is_dir():
@@ -153,7 +163,16 @@ def walk_images(roots, skip_filename_patterns=None):
                     continue
                 if fn.startswith('.'):
                     continue
-                yield os.path.join(dirpath, fn)
+                full = os.path.join(dirpath, fn)
+                if apply_skip_filter and SKIP_FILENAME_PATTERNS and any(p.match(fn) for p in SKIP_FILENAME_PATTERNS):
+                    if SKIP_FILENAME_MAX_SIZE <= 0:
+                        continue
+                    try:
+                        if os.path.getsize(full) <= SKIP_FILENAME_MAX_SIZE:
+                            continue
+                    except OSError:
+                        pass
+                yield full
 
 
 def gather_encodings(image_paths, cache_path, workers):
@@ -319,6 +338,9 @@ def main():
                     help='Use hardlinks instead of copies (must be same filesystem).')
     ap.add_argument('--limit', type=int, default=0,
                     help='Stop after walking N input files (0 = no limit). Useful for testing.')
+    ap.add_argument('--no-skip-filter', action='store_true',
+                    help='Walk every image, including IG-archive junk that find_photos.py '
+                         'would skip. Default applies SKIP_FILENAME_PATTERNS + max-size guard.')
     args = ap.parse_args()
 
     print(f'Inputs:  {args.input}')
@@ -328,11 +350,16 @@ def main():
     print(f'min:     {args.min_samples}')
     print(f'workers: {args.workers}')
     print(f'mode:    {"link" if args.link else "copy"}')
+    if args.no_skip_filter:
+        print('skip filter: DISABLED (walking everything)')
+    else:
+        print(f'skip filter: {[p.pattern for p in SKIP_FILENAME_PATTERNS]} '
+              f'(only when <= {SKIP_FILENAME_MAX_SIZE} bytes)')
     print()
 
     print('Walking input directories...')
     paths = []
-    for p in walk_images(args.input):
+    for p in walk_images(args.input, apply_skip_filter=not args.no_skip_filter):
         paths.append(p)
         if args.limit and len(paths) >= args.limit:
             print(f'  reached --limit {args.limit}, stopping walk')
